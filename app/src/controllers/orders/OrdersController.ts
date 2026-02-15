@@ -2,11 +2,11 @@ import { Request, Response } from "express";
 
 import { Controller } from "../Controller";
 import { OrdersDatabase } from "../../databases/OrdersDatabase";
-import { getOrderStatus } from "../../definitions/enums/OrderStatus";
+import { getOrderStatus, OrderStatus } from "../../definitions/enums/OrderStatus";
 import { OrderFactory } from "../../definitions/entities/Order";
 import { SimpleQueueService } from "../../services/sqs/SimpleQueueService";
 
-const { SQS_ORDER_INTAKE_QUEUE_NAME } = process.env;
+const { SQS_ORDER_INTAKE_QUEUE_NAME, SQS_ORDER_CANCELLATION_QUEUE_NAME } = process.env;
 
 /**
  * @swagger
@@ -30,7 +30,7 @@ export class OrdersController extends Controller {
    *          name: userId
    *          required: false
    *          schema:
-   *            type: number
+   *            type: string
    *            description: The user ID to filter orders by.
    *        - in: query
    *          name: status
@@ -38,7 +38,7 @@ export class OrdersController extends Controller {
    *          schema:
    *            type: string
    *            description: The status to filter orders by.
-   *            enum: [PROCESSING, COMPLETED, ERROR]
+   *            enum: [processing, completed, cancelled, error]
    *        - in: query
    *          name: count
    *          required: true
@@ -98,7 +98,7 @@ export class OrdersController extends Controller {
   public async getOrderById(req: Request, res: Response): Promise<void> {
     try {
       const { orderId } = req.params;
-      const order = await OrdersDatabase.getOrderById(orderId);
+      const order = await OrdersDatabase.getOrderById(Array.isArray(orderId) ? orderId[0] : orderId);
       if (!order) {
         res.status(404).json({ success: false, message: "ORDER_NOT_FOUND" });
         return;
@@ -138,7 +138,7 @@ export class OrdersController extends Controller {
   public async getOrderByReferenceId(req: Request, res: Response): Promise<void> {
     try {
       const { referenceId } = req.params;
-      const order = await OrdersDatabase.getOrderByReferenceId(referenceId);
+      const order = await OrdersDatabase.getOrderByReferenceId(Array.isArray(referenceId) ? referenceId[0] : referenceId);
       if (!order) {
         res.status(404).json({ success: false, message: "ORDER_NOT_FOUND" });
         return;
@@ -207,7 +207,11 @@ export class OrdersController extends Controller {
     * /api/orders:
     *    delete:
     *      tags: [Orders]
-    *      summary: Delete an order.
+    *      summary: Cancel an order and send a cancellation email.
+    *      description: >
+    *        Sets the order status to CANCELLED and queues a cancellation email.
+    *        Only orders in PROCESSING status can be cancelled.
+    *        The order record is preserved for audit purposes.
     *      requestBody:
     *        required: true
     *        content:
@@ -217,16 +221,16 @@ export class OrdersController extends Controller {
     *              properties:
     *                orderId:
     *                  type: string
-    *                  description: The ID for the order.
+    *                  description: The ID for the order to cancel.
     *      produces:
     *        - application/json
     *      responses:
     *        "200":
-    *          description: OK
-    *        "404":
-    *          description: BAD REQUEST
+    *          description: OK - Order cancelled
     *        "400":
-    *          description: BAD REQUEST
+    *          description: BAD REQUEST - Missing orderId or order already cancelled
+    *        "404":
+    *          description: ORDER NOT FOUND
     *        "500":
     *          description: ERROR
     */
@@ -244,8 +248,33 @@ export class OrdersController extends Controller {
         return;
       }
 
-      await OrdersDatabase.deleteOrder(orderId);
-      res.status(200).json({ success: true, order });
+      /* Only block double-cancellation */
+      if (order.status === OrderStatus.CANCELLED) {
+        res.status(400).json({ success: false, message: "ORDER_ALREADY_CANCELLED" });
+        return;
+      }
+
+      /*
+       * Update the order status to CANCELLED and persist it back to DynamoDB.
+       * Used createOrder (PutItem) which replaces the entire item. 
+       */
+      const cancelledOrder = {
+        ...order,
+        status: OrderStatus.CANCELLED,
+        updatedAt: Date.now(),
+        completedAt: Date.now(),
+      };
+      await OrdersDatabase.createOrder(cancelledOrder);
+
+      /* Queue a cancellation email via the pipeline */
+      await SimpleQueueService.sendMessage(
+        SQS_ORDER_CANCELLATION_QUEUE_NAME,
+        "Cancelling order from API",
+        { orderId }
+      );
+
+      this.logger.info(`Order ${orderId} cancelled`);
+      res.status(200).json({ success: true, order: cancelledOrder });
     }
     catch (error) {
       this.handleError(req, res, error);

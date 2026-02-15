@@ -3,6 +3,7 @@ import {
   GetItemCommand,
   PutItemCommand,
   ScanCommand,
+  UpdateItemCommand,
 } from "@aws-sdk/client-dynamodb";
 import { unmarshall, marshall } from "@aws-sdk/util-dynamodb";
 
@@ -41,12 +42,19 @@ export class OrdersDatabase {
 
     /* Build filter expression */
     const filterExpression: Array<string> = [];
-    const expressionAttributeValues = {};
+    const expressionAttributeValues: Record<string, any> = {};
+    /**
+     * BUG FIX: The original code used #name placeholders (e.g. #userId, #status)
+     * in FilterExpression but never defined ExpressionAttributeNames.
+     * This is required by DynamoDB, especially because 'status' is a reserved word.
+     */
+    const expressionAttributeNames: Record<string, string> = {};
 
-    const filters = ['userId', 'status', 'referenceId'];
+    const filters = ['userId', 'status', 'referenceId'] as const;
     for (const filter of filters) {
       if (params[filter]) {
         filterExpression.push(`#${filter} = :${filter}`);
+        expressionAttributeNames[`#${filter}`] = filter;
         expressionAttributeValues[`:${filter}`] = { S: params[filter] };
       }
     }
@@ -55,6 +63,7 @@ export class OrdersDatabase {
       TableName: DYNAMO_TABLE_ORDERS,
       Limit: count,
       FilterExpression: filterExpression.length > 0 ? filterExpression.join(" AND ") : undefined,
+      ExpressionAttributeNames: filterExpression.length > 0 ? expressionAttributeNames : undefined,
       ExpressionAttributeValues: filterExpression.length > 0 ? expressionAttributeValues : undefined,
       Select: "ALL_ATTRIBUTES"
     });
@@ -97,6 +106,54 @@ export class OrdersDatabase {
     const response = await client.send(command);
     if (!response.Items || response.Items.length === 0) return null;
     return response.Items[0] as Order;
+  }
+
+  /**
+   * Updates the status of an order and sets updatedAt timestamp.
+   * Optionally sets completedAt for terminal states.
+   */
+  public static async updateOrderStatus(
+    orderId: string,
+    status: OrderStatus,
+    additionalFields?: Partial<Pick<Order, "completedAt" | "receiptFilePath" | "details">>
+  ): Promise<Order | null> {
+    const client = DynamoService.getClient();
+    if (!DYNAMO_TABLE_ORDERS) throw new Error("DYNAMO_TABLE_ORDERS is not defined");
+
+    let updateExpression = "SET #status = :status, #updatedAt = :updatedAt";
+    const expressionAttributeNames: Record<string, string> = {
+      "#status": "status",
+      "#updatedAt": "updatedAt",
+    };
+    const expressionAttributeValues: Record<string, any> = {
+      ":status": { S: status },
+      ":updatedAt": { N: `${Date.now()}` },
+    };
+
+    if (additionalFields?.completedAt) {
+      updateExpression += ", #completedAt = :completedAt";
+      expressionAttributeNames["#completedAt"] = "completedAt";
+      expressionAttributeValues[":completedAt"] = { N: `${additionalFields.completedAt}` };
+    }
+
+    if (additionalFields?.receiptFilePath) {
+      updateExpression += ", #receiptFilePath = :receiptFilePath";
+      expressionAttributeNames["#receiptFilePath"] = "receiptFilePath";
+      expressionAttributeValues[":receiptFilePath"] = { S: additionalFields.receiptFilePath };
+    }
+
+    const command = new UpdateItemCommand({
+      TableName: DYNAMO_TABLE_ORDERS,
+      Key: { orderId: { S: orderId } },
+      UpdateExpression: updateExpression,
+      ExpressionAttributeNames: expressionAttributeNames,
+      ExpressionAttributeValues: expressionAttributeValues,
+      ReturnValues: "ALL_NEW",
+    });
+
+    const response = await client.send(command);
+    if (!response.Attributes) return null;
+    return unmarshall(response.Attributes) as Order;
   }
 
   public static async deleteOrder(orderId: string): Promise<void> {

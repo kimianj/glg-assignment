@@ -1,28 +1,79 @@
 import {
-  AttributeValue,
+  DeleteItemCommand,
   GetItemCommand,
-  UpdateItemCommand
+  PutItemCommand,
+  ScanCommand,
+  UpdateItemCommand,
 } from "@aws-sdk/client-dynamodb";
 
 import { unmarshall, marshall } from "@aws-sdk/util-dynamodb";
 
 import { MutableOrderFields, Order } from "../definitions/entities/Order";
+import { OrderStatus } from "../definitions/enums/OrderStatus";
 import { DynamoService } from "../services/dynamo/DynamoService";
 import { QueryCommand } from "@aws-sdk/lib-dynamodb";
 
-interface DynamoUpdateParams {
-  UpdateExpression: string;
-  ExpressionAttributeValues: {
-    [key: string]: AttributeValue;
-  };
-  ExpressionAttributeNames?: {
-    [key: string]: string;
-  };
+interface GetOrdersParams {
+  userId?: string;
+  status?: OrderStatus;
+  referenceId?: string;
+  count: number;
 }
 
 const { DYNAMO_TABLE_ORDERS } = process.env;
 
 export class OrdersDatabase {
+  public static async createOrder(order: Order): Promise<void> {
+    const client = DynamoService.getClient();
+    if (!DYNAMO_TABLE_ORDERS) throw new Error("DYNAMO_TABLE_ORDERS is not defined");
+
+    const command = new PutItemCommand({
+      TableName: DYNAMO_TABLE_ORDERS,
+      Item: marshall(order, { removeUndefinedValues: true }),
+    });
+
+    await client.send(command);
+  }
+
+  public static async getOrders(params: GetOrdersParams): Promise<Order[]> {
+    const client = DynamoService.getClient();
+    if (!DYNAMO_TABLE_ORDERS) throw new Error("DYNAMO_TABLE_ORDERS is not defined");
+
+    const { count } = params;
+
+    /* Build filter expression */
+    const filterExpression: Array<string> = [];
+    const expressionAttributeValues: Record<string, any> = {};
+    /**
+     * BUG FIX: Added ExpressionAttributeNames — required when using # placeholders.
+     * 'status' is also a DynamoDB reserved word, making this mandatory.
+     */
+    const expressionAttributeNames: Record<string, string> = {};
+
+    const filters = ['userId', 'status', 'referenceId'] as const;
+    for (const filter of filters) {
+      if (params[filter]) {
+        filterExpression.push(`#${filter} = :${filter}`);
+        expressionAttributeNames[`#${filter}`] = filter;
+        expressionAttributeValues[`:${filter}`] = { S: params[filter] };
+      }
+    }
+
+    const command = new ScanCommand({
+      TableName: DYNAMO_TABLE_ORDERS,
+      Limit: count,
+      FilterExpression: filterExpression.length > 0 ? filterExpression.join(" AND ") : undefined,
+      ExpressionAttributeNames: filterExpression.length > 0 ? expressionAttributeNames : undefined,
+      ExpressionAttributeValues: filterExpression.length > 0 ? expressionAttributeValues : undefined,
+      Select: "ALL_ATTRIBUTES"
+    });
+
+    const response = await client.send(command);
+    if (!response.Items) return [];
+
+    return response.Items.map((item) => unmarshall(item) as Order);
+  }
+
   public static async getOrderById(orderId: string): Promise<Order | null> {
     const client = DynamoService.getClient();
     if (!DYNAMO_TABLE_ORDERS) throw new Error("DYNAMO_TABLE_ORDERS is not defined");
@@ -57,43 +108,47 @@ export class OrdersDatabase {
     return response.Items[0] as Order;
   }
 
-  public static async update(orderId: string, mutableFields: MutableOrderFields): Promise<void> {
-    const { status } = mutableFields;
+  public static async update(orderId: string, fields: MutableOrderFields): Promise<void> {
+    const client = DynamoService.getClient();
+    if (!DYNAMO_TABLE_ORDERS) throw new Error("DYNAMO_TABLE_ORDERS is not defined");
 
-    const params: DynamoUpdateParams = {
-      UpdateExpression: "set updatedAt = :updatedAt",
-      ExpressionAttributeValues: { ":updatedAt": { N: `${Date.now()}` } },
-      ExpressionAttributeNames: {}
-    };
+    /* Always update the updatedAt timestamp */
+    const allFields: MutableOrderFields = { ...fields, updatedAt: Date.now() };
 
-    const manualFields = ["status"];
+    const updateParts: string[] = [];
+    const expressionAttributeNames: Record<string, string> = {};
+    const expressionAttributeValues: Record<string, any> = {};
 
-    Object.entries(mutableFields).forEach((entry) => {
-      const [key, value] = entry;
-      if (!manualFields.includes(key) && value !== undefined && value !== null) {
-        params.UpdateExpression += `, ${key} = :${key}`;
-        params.ExpressionAttributeValues[`:${key}`] = marshall({ [key]: value })[key];
-      }
-    });
+    for (const [key, value] of Object.entries(allFields)) {
+      if (value === undefined) continue;
 
-    if (status !== undefined) {
-      params.UpdateExpression += ", #status = :status";
-      params.ExpressionAttributeValues[":status"] = { S: status };
-      params.ExpressionAttributeNames!["#status"] = "status";
+      updateParts.push(`#${key} = :${key}`);
+      expressionAttributeNames[`#${key}`] = key;
+      expressionAttributeValues[`:${key}`] = marshall({ v: value }).v;
     }
 
-    /* If unused, remove because dynamo won't allow this to be empty */
-    if (params.ExpressionAttributeNames && Object.keys(params.ExpressionAttributeNames).length === 0) {
-      delete params.ExpressionAttributeNames;
-    }
+    if (updateParts.length === 0) return;
 
     const command = new UpdateItemCommand({
-      TableName: DYNAMO_TABLE_ORDERS!,
+      TableName: DYNAMO_TABLE_ORDERS,
       Key: { orderId: { S: orderId } },
-      ...params
+      UpdateExpression: `SET ${updateParts.join(", ")}`,
+      ExpressionAttributeNames: expressionAttributeNames,
+      ExpressionAttributeValues: expressionAttributeValues,
     });
 
-    const dynamo = DynamoService.getClient();
-    await dynamo.send(command);
+    await client.send(command);
+  }
+
+  public static async deleteOrder(orderId: string): Promise<void> {
+    const client = DynamoService.getClient();
+    if (!DYNAMO_TABLE_ORDERS) throw new Error("DYNAMO_TABLE_ORDERS is not defined");
+
+    const command = new DeleteItemCommand({
+      TableName: DYNAMO_TABLE_ORDERS,
+      Key: { orderId: { S: orderId } },
+    });
+
+    await client.send(command);
   }
 }
